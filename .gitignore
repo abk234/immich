@@ -25,5 +25,12 @@ vite.config.js.timestamp-*
 .pnpm-store
 .devcontainer/library
 .devcontainer/.env*
+
+# Local Immich app lifecycle config (see scripts/immich-app.env.example)
+scripts/immich-app.env
+
+# Local docker compose overrides (ports, etc.)
+docker/docker-compose.override.yml
+scripts/.immich-lan-proxy.pid
 *.tsbuildinfo
 *.tsbuildInfo

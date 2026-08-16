@@ -1,0 +1,433 @@
+#!/usr/bin/env bash
+# Start / stop / update Immich locally with data-safe upgrades and configurable backups.
+# Design: docs/superpowers/specs/2026-08-16-immich-app-lifecycle-design.md
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+CONFIG_FILE="${IMMICH_APP_CONFIG:-$ROOT/scripts/immich-app.env}"
+SYNC_SCRIPT="$ROOT/scripts/sync-upstream.sh"
+
+# Defaults (overridden by config / env)
+BACKUP_DIR="${BACKUP_DIR:-$ROOT/../immich-backups}"
+BACKUP_INTERVAL_DAYS="${BACKUP_INTERVAL_DAYS:-7}"
+BACKUP_KEEP="${BACKUP_KEEP:-4}"
+COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.dev.yml}"
+ENV_FILE="${ENV_FILE:-docker/.env}"
+UPDATE_SYNC_ON_UPDATE="${UPDATE_SYNC_ON_UPDATE:-true}"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/immich-app.sh <command> [options]
+
+Commands:
+  start                 Start Immich in the background
+  stop                  Stop containers (keeps all data)
+  down                  Remove containers (keeps volumes/bind mounts; never uses -v)
+  status                Show stack, data paths, and backup status
+  backup                Create a backup now
+  backup --if-due       Backup only if last one is older than BACKUP_INTERVAL_DAYS
+  update                Backup (if due) → optional git sync → rebuild & restart (data kept)
+  schedule-hint         Print cron / launchd examples for weekly backups
+  help                  Show this help
+
+Update options:
+  --sync / --no-sync    Force or skip git sync with upstream (default from config)
+  --backup / --no-backup Force or skip pre-update backup
+  --rebase              When syncing, rebase instead of merge
+
+Config:
+  Copy scripts/immich-app.env.example → scripts/immich-app.env
+  Or set IMMICH_APP_CONFIG=/path/to/file
+EOF
+}
+
+die() { echo "error: $*" >&2; exit 1; }
+info() { echo "→ $*"; }
+warn() { echo "warning: $*" >&2; }
+
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    set -a
+    source "$CONFIG_FILE"
+    set +a
+  fi
+
+  # Resolve relative backup dir against repo root
+  if [[ "$BACKUP_DIR" != /* ]]; then
+    BACKUP_DIR="$ROOT/$BACKUP_DIR"
+  fi
+}
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 || die "docker is not installed or not on PATH"
+  docker info >/dev/null 2>&1 || die "docker is not running (start Docker Desktop)"
+}
+
+ensure_env_file() {
+  if [[ ! -f "$ROOT/$ENV_FILE" ]]; then
+    info "creating $ENV_FILE from docker/example.env"
+    cp "$ROOT/docker/example.env" "$ROOT/$ENV_FILE"
+  fi
+  mkdir -p "$ROOT/docker/library/photos" "$ROOT/docker/library/postgres"
+}
+
+# Load KEY=value from Immich .env without executing it as shell (values may be quoted).
+env_get() {
+  local key="$1" file="$ROOT/$ENV_FILE" line value
+  [[ -f "$file" ]] || return 1
+  line="$(grep -E "^${key}=" "$file" | tail -n1 || true)"
+  [[ -n "$line" ]] || return 1
+  value="${line#*=}"
+  value="${value%\"}"
+  value="${value#\"}"
+  value="${value%\'}"
+  value="${value#\'}"
+  printf '%s' "$value"
+}
+
+upload_location() {
+  local loc
+  loc="$(env_get UPLOAD_LOCATION || true)"
+  loc="${loc:-./library}"
+  if [[ "$loc" != /* ]]; then
+    # Paths in docker/.env are relative to docker/
+    loc="$ROOT/docker/$loc"
+  fi
+  # normalize
+  (cd "$(dirname "$loc")" && echo "$(pwd)/$(basename "$loc")")
+}
+
+compose() {
+  (
+    cd "$ROOT/docker"
+    local args=(-f "./$COMPOSE_FILE")
+    # Explicit -f disables automatic override loading; include it when present.
+    if [[ -f ./docker-compose.override.yml ]]; then
+      args+=(-f ./docker-compose.override.yml)
+    fi
+    COMPOSE_BAKE=true docker compose "${args[@]}" --env-file "$(basename "$ENV_FILE")" "$@"
+  )
+}
+
+stack_running() {
+  local ids
+  ids="$(compose ps -q 2>/dev/null || true)"
+  [[ -n "$ids" ]]
+}
+
+postgres_running() {
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'immich_postgres'
+}
+
+last_backup_dir() {
+  [[ -d "$BACKUP_DIR" ]] || return 1
+  # Prefer marker file; fall back to newest timestamp dir
+  local latest
+  latest="$(ls -1dt "$BACKUP_DIR"/20* 2>/dev/null | head -n1 || true)"
+  [[ -n "$latest" ]] || return 1
+  echo "$latest"
+}
+
+backup_age_days() {
+  local latest mtime now
+  latest="$(last_backup_dir)" || return 1
+  if [[ -f "$latest/.immich-backup-complete" ]]; then
+    mtime="$(stat -f %m "$latest/.immich-backup-complete" 2>/dev/null || stat -c %Y "$latest/.immich-backup-complete")"
+  else
+    mtime="$(stat -f %m "$latest" 2>/dev/null || stat -c %Y "$latest")"
+  fi
+  now="$(date +%s)"
+  echo $(( (now - mtime) / 86400 ))
+}
+
+prune_backups() {
+  local keep="${BACKUP_KEEP:-4}"
+  [[ "$keep" =~ ^[0-9]+$ ]] || return 0
+  [[ -d "$BACKUP_DIR" ]] || return 0
+  local i=0 dir
+  # Portable on macOS Bash 3.2 (no mapfile)
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || continue
+    i=$((i + 1))
+    if [[ "$i" -gt "$keep" ]]; then
+      info "pruning old backup: $dir"
+      rm -rf "$dir"
+    fi
+  done < <(ls -1dt "$BACKUP_DIR"/20* 2>/dev/null || true)
+}
+
+build_plugins() {
+  if command -v mise >/dev/null 2>&1; then
+    info "building plugins (required by Immich server)"
+    (cd "$ROOT" && mise run plugins)
+  else
+    warn "mise not found; skipping plugins build — server may fail until you run: mise run plugins"
+  fi
+}
+
+LAN_PROXY="$ROOT/scripts/immich-lan-proxy.py"
+LAN_PROXY_PID="$ROOT/scripts/.immich-lan-proxy.pid"
+
+lan_ip() {
+  ipconfig getifaddr en7 2>/dev/null || ipconfig getifaddr en0 2>/dev/null || true
+}
+
+stop_lan_proxy() {
+  if [[ -f "$LAN_PROXY_PID" ]]; then
+    local pid
+    pid="$(cat "$LAN_PROXY_PID" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      info "stopping LAN proxy (pid $pid)"
+      kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$LAN_PROXY_PID"
+  fi
+  pkill -f 'immich-lan-proxy.py' 2>/dev/null || true
+}
+
+start_lan_proxy() {
+  stop_lan_proxy
+  [[ -f "$LAN_PROXY" ]] || die "missing $LAN_PROXY"
+  info "starting LAN proxy (phone access via LAN IP:2283 → localhost:2283)"
+  python3 "$LAN_PROXY" --daemon --pid-file "$LAN_PROXY_PID"
+  sleep 0.5
+  local lip
+  lip="$(lan_ip)"
+  if [[ -n "$lip" ]]; then
+    info "phone Server URL: http://${lip}:2283"
+  else
+    info "phone Server URL: http://<your-mac-lan-ip>:2283"
+  fi
+}
+
+cmd_start() {
+  require_docker
+  ensure_env_file
+  build_plugins
+  info "starting Immich (detached)"
+  compose up -d --remove-orphans --build
+  start_lan_proxy
+  info "web UI: http://localhost:3000  (API localhost: http://127.0.0.1:2283)"
+  info "first boot can take several minutes while containers install deps"
+  compose ps
+}
+
+cmd_stop() {
+  require_docker
+  ensure_env_file
+  stop_lan_proxy
+  info "stopping Immich containers (data retained)"
+  compose stop
+}
+
+cmd_down() {
+  require_docker
+  ensure_env_file
+  stop_lan_proxy
+  info "removing Immich containers (no -v; data retained)"
+  compose down --remove-orphans
+}
+
+cmd_status() {
+  require_docker
+  ensure_env_file
+  local upload
+  upload="$(upload_location)"
+
+  echo "config:     $CONFIG_FILE$([ -f "$CONFIG_FILE" ] && echo '' || echo ' (missing — using defaults)')"
+  echo "compose:    docker/$COMPOSE_FILE"
+  echo "env:        $ENV_FILE"
+  echo "upload:     $upload"
+  echo "photos:     $upload/photos"
+  echo "postgres:   $upload/postgres"
+  echo "backups:    $BACKUP_DIR"
+  echo "interval:   every $BACKUP_INTERVAL_DAYS day(s), keep $BACKUP_KEEP"
+  echo
+
+  if stack_running; then
+    compose ps
+  else
+    echo "stack:      not running"
+  fi
+  echo
+
+  local latest age
+  if latest="$(last_backup_dir)"; then
+    age="$(backup_age_days || echo '?')"
+    echo "last backup: $latest (${age} day(s) ago)"
+  else
+    echo "last backup: none"
+  fi
+}
+
+do_backup() {
+  local if_due=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --if-due) if_due=true ;;
+      *) die "unknown backup option: $1" ;;
+    esac
+    shift
+  done
+
+  ensure_env_file
+  local upload
+  upload="$(upload_location)"
+
+  if [[ "$if_due" == true ]]; then
+    local age
+    if age="$(backup_age_days 2>/dev/null)"; then
+      if [[ "$age" -lt "$BACKUP_INTERVAL_DAYS" ]]; then
+        info "backup not due (last was ${age}d ago; interval ${BACKUP_INTERVAL_DAYS}d)"
+        return 0
+      fi
+    fi
+  fi
+
+  require_docker
+  mkdir -p "$BACKUP_DIR"
+  local stamp dest was_running=false
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  dest="$BACKUP_DIR/$stamp"
+  mkdir -p "$dest"
+
+  info "backing up to $dest"
+
+  if stack_running; then
+    was_running=true
+  fi
+
+  # Prefer logical DB dump while Postgres is up; otherwise copy data dir after stop.
+  if postgres_running; then
+    info "dumping database (pg_dumpall)"
+    docker exec immich_postgres pg_dumpall -U "$(env_get DB_USERNAME || echo postgres)" \
+      >"$dest/postgres.sql"
+    info "copying photos"
+    mkdir -p "$dest/photos"
+    if [[ -d "$upload/photos" ]]; then
+      rsync -a "$upload/photos/" "$dest/photos/" 2>/dev/null || cp -a "$upload/photos/." "$dest/photos/"
+    fi
+  else
+    info "postgres not running — stopping stack briefly for consistent filesystem copy"
+    if [[ "$was_running" == true ]]; then
+      compose stop
+    fi
+    if [[ -d "$upload" ]]; then
+      rsync -a "$upload/" "$dest/upload/" 2>/dev/null || cp -a "$upload/." "$dest/upload/"
+    else
+      warn "upload location missing: $upload"
+    fi
+  fi
+
+  if [[ -f "$ROOT/$ENV_FILE" ]]; then
+    cp "$ROOT/$ENV_FILE" "$dest/docker.env"
+  fi
+
+  cat >"$dest/MANIFEST.txt" <<EOF
+created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+upload_location=$upload
+hostname=$(hostname)
+git_head=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
+EOF
+  touch "$dest/.immich-backup-complete"
+
+  prune_backups
+  info "backup complete: $dest"
+
+  if [[ "$was_running" == true ]] && ! stack_running; then
+    info "restarting stack after backup"
+    compose start
+  fi
+}
+
+cmd_update() {
+  local do_sync="$UPDATE_SYNC_ON_UPDATE"
+  local do_backup="if-due"
+  local rebase=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --sync) do_sync=true ;;
+      --no-sync) do_sync=false ;;
+      --backup) do_backup=force ;;
+      --no-backup) do_backup=skip ;;
+      --rebase) rebase=true ;;
+      *) die "unknown update option: $1" ;;
+    esac
+    shift
+  done
+
+  require_docker
+  ensure_env_file
+
+  case "$do_backup" in
+    force) do_backup ;;
+    if-due) do_backup --if-due ;;
+    skip) info "skipping backup (--no-backup)" ;;
+  esac
+
+  if [[ "$do_sync" == true || "$do_sync" == "true" ]]; then
+    [[ -x "$SYNC_SCRIPT" ]] || die "missing $SYNC_SCRIPT"
+    info "syncing from Immich upstream"
+    if [[ "$rebase" == true ]]; then
+      "$SYNC_SCRIPT" sync --rebase
+    else
+      "$SYNC_SCRIPT" sync
+    fi
+  else
+    info "skipping git sync"
+  fi
+
+  build_plugins
+  info "rebuilding and recreating containers (bind mounts / data kept)"
+  # Intentionally no -v / --renew-anon-volumes: protect library + postgres data.
+  compose up -d --build --remove-orphans --force-recreate
+  info "update complete"
+  compose ps
+  info "web UI: http://localhost:3000"
+}
+
+cmd_schedule_hint() {
+  local script="$ROOT/scripts/immich-app.sh"
+  cat <<EOF
+# Cron (weekly Sunday 03:15) — uses BACKUP_INTERVAL_DAYS via --if-due
+15 3 * * 0 $script backup --if-due >>$BACKUP_DIR/backup.log 2>&1
+
+# Cron (daily check; only backs up when due)
+15 3 * * * $script backup --if-due >>$BACKUP_DIR/backup.log 2>&1
+
+# macOS launchd (save as ~/Library/LaunchAgents/com.immich.backup.plist)
+# ProgramArguments: $script
+#               backup
+#               --if-due
+# StartCalendarInterval: Weekday=0 Hour=3 Minute=15
+
+Config file: $CONFIG_FILE
+BACKUP_DIR=$BACKUP_DIR
+BACKUP_INTERVAL_DAYS=$BACKUP_INTERVAL_DAYS
+EOF
+}
+
+main() {
+  load_config
+  local cmd="${1:-}"
+  [[ -n "$cmd" ]] || { usage; exit 1; }
+  shift || true
+
+  case "$cmd" in
+    -h|--help|help) usage ;;
+    start) cmd_start ;;
+    stop) cmd_stop ;;
+    down) cmd_down ;;
+    status) cmd_status ;;
+    backup) do_backup "$@" ;;
+    update) cmd_update "$@" ;;
+    schedule-hint) cmd_schedule_hint ;;
+    *) die "unknown command: $cmd (try help)" ;;
+  esac
+}
+
+main "$@"
