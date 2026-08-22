@@ -188,6 +188,123 @@ stop_lan_proxy() {
   pkill -f 'immich-lan-proxy.py' 2>/dev/null || true
 }
 
+lan_proxy_running() {
+  if [[ -f "$LAN_PROXY_PID" ]]; then
+    local pid
+    pid="$(cat "$LAN_PROXY_PID" 2>/dev/null || true)"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 0
+  fi
+  pgrep -f 'immich-lan-proxy.py' >/dev/null 2>&1
+}
+
+phone_server_url() {
+  local lip
+  lip="$(lan_ip)"
+  [[ -n "$lip" ]] && printf 'http://%s:2283' "$lip"
+}
+
+# ok | waiting | proxy_down | proxy_broken | no_lan_ip | unreachable
+check_phone_access() {
+  local lip body
+  lip="$(lan_ip)"
+  if [[ -z "$lip" ]]; then
+    echo "no_lan_ip"
+    return
+  fi
+  if ! lan_proxy_running; then
+    echo "proxy_down"
+    return
+  fi
+  body="$(curl -sf --connect-timeout 3 --max-time 5 "http://${lip}:2283/api/server/version" 2>/dev/null || true)"
+  if [[ -n "$body" ]] && echo "$body" | grep -q '"major"'; then
+    echo "ok"
+    return
+  fi
+  # Distinguish a broken proxy from a server that is still booting.
+  body="$(curl -sf --connect-timeout 2 --max-time 5 http://127.0.0.1:2283/api/server/version 2>/dev/null || true)"
+  if [[ -n "$body" ]] && echo "$body" | grep -q '"major"'; then
+    echo "proxy_broken"
+    return
+  fi
+  body="$(curl -sf --connect-timeout 2 --max-time 5 http://127.0.0.1:2283/api/server/ping 2>/dev/null || true)"
+  if [[ -n "$body" ]]; then
+    echo "waiting"
+    return
+  fi
+  echo "server_starting"
+}
+
+phone_access_status_line() {
+  local state url
+  state="$(check_phone_access)"
+  url="$(phone_server_url)"
+  case "$state" in
+    ok)
+      echo "phone access: OK — mobile URL ${url} (port 2283, not 3000)"
+      ;;
+    no_lan_ip)
+      echo "phone access: unknown — no LAN IP detected (connect to Wi-Fi and re-check)"
+      ;;
+    proxy_down)
+      echo "phone access: BROKEN — LAN proxy not running (run: scripts/immich-app.sh start)"
+      ;;
+    proxy_broken)
+      echo "phone access: BROKEN — LAN proxy not forwarding (run: scripts/immich-app.sh stop && scripts/immich-app.sh start)"
+      ;;
+    waiting|server_starting)
+      if [[ -n "$url" ]]; then
+        echo "phone access: waiting — API still starting; use ${url} once ready"
+      else
+        echo "phone access: waiting — API still starting"
+      fi
+      ;;
+    *)
+      if [[ -n "$url" ]]; then
+        echo "phone access: BROKEN — cannot reach ${url}/api/server/version"
+      else
+        echo "phone access: BROKEN — cannot reach API via LAN"
+      fi
+      ;;
+  esac
+}
+
+verify_phone_access() {
+  local state url
+  state="$(check_phone_access)"
+  if [[ "$state" == "ok" ]]; then
+    url="$(phone_server_url)"
+    info "phone access check: OK (${url})"
+    return 0
+  fi
+  if [[ "$state" == "proxy_broken" || "$state" == "proxy_down" ]]; then
+    warn "phone access check failed ($state) — restarting LAN proxy"
+    start_lan_proxy
+    sleep 1
+    state="$(check_phone_access)"
+    if [[ "$state" == "ok" ]]; then
+      url="$(phone_server_url)"
+      info "phone access check: OK after proxy restart (${url})"
+      return 0
+    fi
+  fi
+  url="$(phone_server_url)"
+  case "$state" in
+    server_starting|waiting)
+      warn "phone access check: API still starting — mobile may fail until the server is ready"
+      [[ -n "$url" ]] && warn "then use ${url} in the mobile app (port 2283, not 3000)"
+      ;;
+    no_lan_ip)
+      warn "phone access check: no LAN IP detected — connect to Wi-Fi and run: scripts/immich-app.sh status"
+      ;;
+    *)
+      warn "phone access check: FAILED ($state)"
+      warn "mobile app needs port 2283 (not 3000). Try: scripts/immich-app.sh stop && scripts/immich-app.sh start"
+      [[ -n "$url" ]] && warn "expected URL: ${url}"
+      ;;
+  esac
+  return 1
+}
+
 start_lan_proxy() {
   stop_lan_proxy
   [[ -f "$LAN_PROXY" ]] || die "missing $LAN_PROXY"
@@ -210,6 +327,7 @@ cmd_start() {
   info "starting Immich (detached)"
   compose up -d --remove-orphans --build
   start_lan_proxy
+  verify_phone_access || true
   info "web UI: http://localhost:3000  (API localhost: http://127.0.0.1:2283)"
   info "first boot can take several minutes while containers install deps"
   compose ps
@@ -252,6 +370,8 @@ cmd_status() {
   else
     echo "stack:      not running"
   fi
+  echo
+  echo "$(phone_access_status_line)"
   echo
 
   local latest age
@@ -385,6 +505,8 @@ cmd_update() {
   info "rebuilding and recreating containers (bind mounts / data kept)"
   # Intentionally no -v / --renew-anon-volumes: protect library + postgres data.
   compose up -d --build --remove-orphans --force-recreate
+  start_lan_proxy
+  verify_phone_access || true
   info "update complete"
   compose ps
   info "web UI: http://localhost:3000"
