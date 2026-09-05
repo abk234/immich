@@ -305,16 +305,34 @@ verify_phone_access() {
   return 1
 }
 
+# Prefer /usr/bin/python3: Homebrew Python upgrades change the binary path and
+# macOS Firewall then blocks the new binary (empty reply on LAN) until re-allowed.
+lan_proxy_python() {
+  if [[ -x /usr/bin/python3 ]]; then
+    echo /usr/bin/python3
+    return
+  fi
+  command -v python3
+}
+
 start_lan_proxy() {
   stop_lan_proxy
   [[ -f "$LAN_PROXY" ]] || die "missing $LAN_PROXY"
-  info "starting LAN proxy (phone access via LAN IP:2283 → localhost:2283)"
-  python3 "$LAN_PROXY" --daemon --pid-file "$LAN_PROXY_PID"
-  sleep 0.5
+  local py
+  py="$(lan_proxy_python)"
+  [[ -n "$py" ]] || die "python3 not found (needed for LAN phone proxy)"
+  info "starting LAN proxy with $py (phone :2283 → localhost:2283)"
+  "$py" "$LAN_PROXY" --daemon --pid-file "$LAN_PROXY_PID"
+  sleep 0.8
   local lip
   lip="$(lan_ip)"
   if [[ -n "$lip" ]]; then
     info "phone Server URL: http://${lip}:2283"
+    # Fail fast if firewall is blocking this Python binary again.
+    if ! curl -sf --connect-timeout 3 --max-time 5 "http://${lip}:2283/api/server/ping" >/dev/null 2>&1; then
+      warn "LAN proxy started but http://${lip}:2283 is not reachable"
+      warn "macOS Firewall may be blocking $py — allow incoming for that Python, then re-run start"
+    fi
   else
     info "phone Server URL: http://<your-mac-lan-ip>:2283"
   fi
