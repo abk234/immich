@@ -168,11 +168,24 @@ build_plugins() {
   fi
 }
 
-LAN_PROXY="$ROOT/scripts/immich-lan-proxy.py"
+LAN_PROXY_APP="$ROOT/scripts/ImmichLanProxy.app"
+LAN_PROXY_BIN="$LAN_PROXY_APP/Contents/MacOS/ImmichLanProxy"
+LAN_PROXY_PY="$ROOT/scripts/immich-lan-proxy.py"
 LAN_PROXY_PID="$ROOT/scripts/.immich-lan-proxy.pid"
 
 lan_ip() {
   ipconfig getifaddr en7 2>/dev/null || ipconfig getifaddr en0 2>/dev/null || true
+}
+
+ensure_lan_proxy_bin() {
+  if [[ -x "$LAN_PROXY_BIN" ]]; then
+    return 0
+  fi
+  if [[ -x "$ROOT/scripts/build-immich-lan-proxy.sh" ]] && command -v go >/dev/null 2>&1; then
+    info "building ImmichLanProxy.app (dedicated firewall allowlist binary)"
+    "$ROOT/scripts/build-immich-lan-proxy.sh"
+  fi
+  [[ -x "$LAN_PROXY_BIN" ]]
 }
 
 stop_lan_proxy() {
@@ -185,6 +198,7 @@ stop_lan_proxy() {
     fi
     rm -f "$LAN_PROXY_PID"
   fi
+  pkill -f 'ImmichLanProxy' 2>/dev/null || true
   pkill -f 'immich-lan-proxy.py' 2>/dev/null || true
 }
 
@@ -194,7 +208,7 @@ lan_proxy_running() {
     pid="$(cat "$LAN_PROXY_PID" 2>/dev/null || true)"
     [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 0
   fi
-  pgrep -f 'immich-lan-proxy.py' >/dev/null 2>&1
+  pgrep -f 'ImmichLanProxy|immich-lan-proxy.py' >/dev/null 2>&1
 }
 
 phone_server_url() {
@@ -305,33 +319,34 @@ verify_phone_access() {
   return 1
 }
 
-# Prefer /usr/bin/python3: Homebrew Python upgrades change the binary path and
-# macOS Firewall then blocks the new binary (empty reply on LAN) until re-allowed.
-lan_proxy_python() {
-  if [[ -x /usr/bin/python3 ]]; then
-    echo /usr/bin/python3
-    return
-  fi
-  command -v python3
-}
-
 start_lan_proxy() {
   stop_lan_proxy
-  [[ -f "$LAN_PROXY" ]] || die "missing $LAN_PROXY"
-  local py
-  py="$(lan_proxy_python)"
-  [[ -n "$py" ]] || die "python3 not found (needed for LAN phone proxy)"
-  info "starting LAN proxy with $py (phone :2283 → localhost:2283)"
-  "$py" "$LAN_PROXY" --daemon --pid-file "$LAN_PROXY_PID"
-  sleep 0.8
   local lip
   lip="$(lan_ip)"
+
+  if ensure_lan_proxy_bin; then
+    info "starting ImmichLanProxy.app (phone :2283 → localhost:2283)"
+    info "Firewall: allow ONLY \"Immich LAN Proxy\" / ImmichLanProxy — not all of Python"
+    "$LAN_PROXY_BIN" -daemon -pid-file "$LAN_PROXY_PID"
+  elif [[ -f "$LAN_PROXY_PY" ]]; then
+    warn "ImmichLanProxy.app missing; falling back to Python (less ideal for Firewall)"
+    local py
+    py="/usr/bin/python3"
+    [[ -x "$py" ]] || py="$(command -v python3)"
+    [[ -n "$py" ]] || die "python3 not found and ImmichLanProxy.app not built"
+    "$py" "$LAN_PROXY_PY" --daemon --pid-file "$LAN_PROXY_PID"
+  else
+    die "missing LAN proxy (build with scripts/build-immich-lan-proxy.sh)"
+  fi
+
+  sleep 0.8
   if [[ -n "$lip" ]]; then
     info "phone Server URL: http://${lip}:2283"
-    # Fail fast if firewall is blocking this Python binary again.
-    if ! curl -sf --connect-timeout 3 --max-time 5 "http://${lip}:2283/api/server/ping" >/dev/null 2>&1; then
+    if ! python3 -c "import urllib.request; urllib.request.urlopen('http://${lip}:2283/api/server/ping', timeout=5)" >/dev/null 2>&1; then
       warn "LAN proxy started but http://${lip}:2283 is not reachable"
-      warn "macOS Firewall may be blocking $py — allow incoming for that Python, then re-run start"
+      warn "1) System Settings → Network → Firewall: turn OFF \"Block all incoming\""
+      warn "2) Options → allow ImmichLanProxy / Immich LAN Proxy (incoming)"
+      warn "3) If Little Snitch is on, allow ImmichLanProxy on port 2283"
     fi
   else
     info "phone Server URL: http://<your-mac-lan-ip>:2283"

@@ -32,5 +32,6 @@ scripts/immich-app.env
 # Local docker compose overrides (ports, etc.)
 docker/docker-compose.override.yml
 scripts/.immich-lan-proxy.pid
+scripts/ImmichLanProxy.app/
 *.tsbuildinfo
 *.tsbuildInfo
