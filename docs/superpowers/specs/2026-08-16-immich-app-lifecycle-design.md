@@ -21,7 +21,7 @@ Manage start/stop/update of the local Immich stack and configurable backups so u
 | `status` | containers, data paths, last backup |
 | `backup` | snapshot data into `BACKUP_DIR/<timestamp>/` |
 | `backup --if-due` | backup only if older than `BACKUP_INTERVAL_DAYS` |
-| `update` | backup (due/forced) → optional git sync → rebuild/recreate without wiping data |
+| `update` | compare host vs GitHub latest; if newer → backup → optional git sync → bump `IMMICH_VERSION` → pull/recreate (data kept); `--check` compare-only |
 | `schedule-hint` | print cron/launchd examples |
 
 ## Config (`scripts/immich-app.env`)
