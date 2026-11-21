@@ -28,12 +28,13 @@ Commands:
   status                Show stack, data paths, and backup status
   backup                Create a backup now
   backup --if-due       Backup only if last one is older than BACKUP_INTERVAL_DAYS
-  update                Backup (if due) → optional git sync → rebuild & restart (data kept)
+  update                Compare host vs latest release; upgrade pin+images if newer
   schedule-hint         Print cron / launchd examples for weekly backups
   help                  Show this help
 
 Update options:
-  --sync / --no-sync    Force or skip git sync with upstream (default from config)
+  --check               Compare versions only (no backup, pin change, pull, or recreate)
+  --sync / --no-sync    Force or skip git sync with upstream (default: skip)
   --backup / --no-backup Force or skip pre-update backup
   --rebase              When syncing, rebase instead of merge
 
@@ -570,6 +571,7 @@ cmd_update() {
   local do_sync="$UPDATE_SYNC_ON_UPDATE"
   local do_backup="if-due"
   local rebase=false
+  local check_only=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -578,13 +580,40 @@ cmd_update() {
       --backup) do_backup=force ;;
       --no-backup) do_backup=skip ;;
       --rebase) rebase=true ;;
+      --check) check_only=true ;;
       *) die "unknown update option: $1" ;;
     esac
     shift
   done
 
-  require_docker
   ensure_env_file
+
+  local host latest
+  host="$(host_immich_version || true)"
+  [[ -n "$host" ]] || die "could not determine host Immich version (API down and IMMICH_VERSION unset?)"
+  latest="$(latest_immich_version)"
+
+  local cmp_ec=0
+  version_cmp "$host" "$latest" || cmp_ec=$?
+  local status
+  case "$cmp_ec" in
+    0) status="up to date" ;;
+    1) status="update available" ;;
+    *) die "cannot compare versions host=$host latest=$latest" ;;
+  esac
+  print_version_comparison "$host" "$latest" "$status"
+
+  if [[ "$cmp_ec" -eq 0 ]]; then
+    info "nothing to do"
+    return 0
+  fi
+
+  if [[ "$check_only" == true ]]; then
+    info "check only — not applying update"
+    return 0
+  fi
+
+  require_docker
 
   case "$do_backup" in
     force) do_backup ;;
@@ -604,15 +633,26 @@ cmd_update() {
     info "skipping git sync"
   fi
 
+  info "setting IMMICH_VERSION=$latest"
+  set_immich_version "$latest"
+
+  info "pulling images"
+  compose pull
+
   build_plugins
   info "rebuilding and recreating containers (bind mounts / data kept)"
   # Intentionally no -v / --renew-anon-volumes: protect library + postgres data.
-  compose up -d --build --remove-orphans --force-recreate
+  if ! compose up -d --build --remove-orphans --force-recreate; then
+    die "recreate failed after pinning $latest — see backups under $BACKUP_DIR"
+  fi
   start_lan_proxy
   verify_phone_access || true
-  info "update complete"
+
+  local final
+  final="$(host_immich_version || true)"
+  info "update complete — host now: ${final:-unknown} (target $latest)"
   compose ps
-  info "web UI: http://localhost:3000"
+  info "API / web: http://127.0.0.1:2283"
 }
 
 cmd_schedule_hint() {
