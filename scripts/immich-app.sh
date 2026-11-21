@@ -15,7 +15,7 @@ BACKUP_INTERVAL_DAYS="${BACKUP_INTERVAL_DAYS:-7}"
 BACKUP_KEEP="${BACKUP_KEEP:-4}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.dev.yml}"
 ENV_FILE="${ENV_FILE:-docker/.env}"
-UPDATE_SYNC_ON_UPDATE="${UPDATE_SYNC_ON_UPDATE:-true}"
+UPDATE_SYNC_ON_UPDATE="${UPDATE_SYNC_ON_UPDATE:-false}"
 
 usage() {
   cat <<'EOF'
@@ -86,6 +86,76 @@ env_get() {
   value="${value%\'}"
   value="${value#\'}"
   printf '%s' "$value"
+}
+
+normalize_version() {
+  local raw="${1:-}"
+  if [[ "$raw" =~ \"major\":([0-9]+)[^0-9]+\"minor\":([0-9]+)[^0-9]+\"patch\":([0-9]+) ]]; then
+    printf 'v%s.%s.%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    return 0
+  fi
+  raw="${raw#v}"
+  if [[ "$raw" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    printf 'v%s.%s.%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    return 0
+  fi
+  return 1
+}
+
+# Exit 0 if a >= b, 1 if a < b, 2 if either unparseable.
+version_cmp() {
+  local a b
+  a="$(normalize_version "$1")" || return 2
+  b="$(normalize_version "$2")" || return 2
+  local IFS=.
+  # shellcheck disable=SC2086
+  set -- ${a#v} ${b#v}
+  local a0=$1 a1=$2 a2=$3 b0=$4 b1=$5 b2=$6
+  if (( a0 > b0 || (a0 == b0 && a1 > b1) || (a0 == b0 && a1 == b1 && a2 >= b2) )); then
+    return 0
+  fi
+  return 1
+}
+
+host_immich_version() {
+  local body pin
+  body="$(curl -sf --connect-timeout 2 --max-time 5 http://127.0.0.1:2283/api/server/version 2>/dev/null || true)"
+  if pin="$(normalize_version "$body")"; then
+    printf '%s' "$pin"
+    return 0
+  fi
+  pin="$(env_get IMMICH_VERSION || true)"
+  normalize_version "$pin"
+}
+
+latest_immich_version() {
+  local json tag
+  json="$(curl -sf --connect-timeout 5 --max-time 15 \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'User-Agent: immich-app.sh' \
+    https://api.github.com/repos/immich-app/immich/releases/latest)" \
+    || die "could not fetch latest Immich release from GitHub"
+  tag="$(printf '%s' "$json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  [[ -n "$tag" ]] || die "GitHub latest release missing tag_name"
+  normalize_version "$tag" || die "unparseable latest tag: $tag"
+}
+
+print_version_comparison() {
+  local host="$1" latest="$2" status="$3"
+  info "host: ${host:-unknown}  latest: ${latest}  status: ${status}"
+}
+
+set_immich_version() {
+  local tag="$1" file="$ROOT/$ENV_FILE"
+  [[ -f "$file" ]] || die "missing $file"
+  if grep -qE '^IMMICH_VERSION=' "$file"; then
+    local tmp
+    tmp="$(mktemp)"
+    sed "s/^IMMICH_VERSION=.*/IMMICH_VERSION=${tag}/" "$file" >"$tmp"
+    mv "$tmp" "$file"
+  else
+    printf '\nIMMICH_VERSION=%s\n' "$tag" >>"$file"
+  fi
 }
 
 upload_location() {
@@ -584,5 +654,9 @@ main() {
     *) die "unknown command: $cmd (try help)" ;;
   esac
 }
+
+if [[ "${IMMICH_APP_SOURCED:-}" == 1 ]]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 main "$@"
