@@ -391,6 +391,11 @@ verify_phone_access() {
 }
 
 start_lan_proxy() {
+  if [[ "${LAN_PROXY_ENABLED:-true}" != "true" ]]; then
+    stop_lan_proxy
+    info "LAN proxy disabled (LAN_PROXY_ENABLED=${LAN_PROXY_ENABLED}); devices use the home-gateway (Traefik) instead"
+    return 0
+  fi
   stop_lan_proxy
   local lip
   lip="$(lan_ip)"
